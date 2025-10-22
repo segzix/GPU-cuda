@@ -433,21 +433,22 @@ std::vector<int> scnn_inference(const std::vector<std::vector<float>>& images,
     // Thread config
     const int threads = 256;
 
+    const size_t elems_per_img = (size_t)in_c * in_h * in_w;
+    size_t       NImgsBytes    = (size_t)N * elems_per_img * sizeof(float);
+    float*       h_pinned      = nullptr;
+    checkCudaErrors(cudaHostAlloc((void**)&h_pinned, NImgsBytes, cudaHostAllocDefault));
+
     // Process the dataset in chunks of N
     for (int base = 0; base < num_images; base += N) {
         int    curN         = std::min(N, num_images - base);
-        size_t curImgsBytes = (size_t)curN * in_c * in_h * in_w * sizeof(float);
-
+        size_t curImgsBytes = (size_t)curN * elems_per_img * sizeof(float);
         // Pack host images into a contiguous pinned buffer to speed H2D copy
-        float* h_pinned = nullptr;
-        checkCudaErrors(cudaHostAlloc((void**)&h_pinned, curImgsBytes, cudaHostAllocDefault));
         for (int n = 0; n < curN; ++n) {
-            std::memcpy(h_pinned + (size_t)n * in_c * in_h * in_w,
+            std::memcpy(h_pinned + (size_t)n * elems_per_img,
                         images[base + n].data(),
-                        (size_t)in_c * in_h * in_w * sizeof(float));
+                        elems_per_img * sizeof(float));
         }
         checkCudaErrors(cudaMemcpy(d_imgs, h_pinned, curImgsBytes, cudaMemcpyHostToDevice));
-        checkCudaErrors(cudaFreeHost(h_pinned));
 
         // Zero membrane and accumulation for this chunk
         checkCudaErrors(cudaMemset(d_v1, 0, (size_t)curN * c1 * c1_h * c1_w * sizeof(float)));
@@ -529,6 +530,8 @@ std::vector<int> scnn_inference(const std::vector<std::vector<float>>& images,
             predictions.push_back(pred);
         }
     }
+
+    checkCudaErrors(cudaFreeHost(h_pinned));
 
     // free intermediates
     checkCudaErrors(cudaFree(d_imgs));
