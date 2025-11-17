@@ -105,18 +105,18 @@ __global__ void conv2d_kernel_batched(const float* input,
                                       int          padding,
                                       int          output_height,
                                       int          output_width) {
-    int out_size = output_height * output_width;
-    int total    = N * out_channels * out_size;
-    int idx      = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total)
-        return;
+    int ow = blockIdx.x * blockDim.x + threadIdx.x; // 输出列
+    int oh = blockIdx.y * blockDim.y + threadIdx.y; // 输出行
 
-    int n   = idx / (out_channels * out_size);
-    int rem = idx % (out_channels * out_size);
-    int oc  = rem / out_size;
-    int pos = rem % out_size;
-    int oh  = pos / output_width;
-    int ow  = pos % output_width;
+    if (ow >= output_width || oh >= output_height) {
+        return;
+    }
+
+    // 2. 用 grid.z 编码 batch 维和 out_channel 维
+    //    nz = n * out_channels + oc
+    int nz = blockIdx.z;
+    int n  = nz / out_channels; // 第几个样本
+    int oc = nz % out_channels; // 第几个输出通道
 
     float sum = 0.0f;
 
@@ -335,31 +335,38 @@ std::vector<int> scnn_inference(const std::vector<std::vector<float>>& images,
         checkCudaErrors(cudaMemset(d_logits_sum, 0, (size_t)curN * fc3_out * sizeof(float)));
 
         // 计算每个层的线程块数量
-        int blocks_conv1 = (curN * c1 * c1_h * c1_w + threads - 1) / threads;
-        int blocks_pool1 = (curN * c1 * p1_h * p1_w + threads - 1) / threads;
-        int blocks_conv2 = (curN * c2 * c2_h * c2_w + threads - 1) / threads;
-        int blocks_pool2 = (curN * c2 * p2_h * p2_w + threads - 1) / threads;
-        int blocks_fc1   = (curN * fc1_out + threads - 1) / threads;
-        int blocks_fc2   = (curN * fc2_out + threads - 1) / threads;
-        int blocks_fc3   = (curN * fc3_out + threads - 1) / threads;
+        int  blocks_conv1 = (curN * c1 * c1_h * c1_w + threads - 1) / threads;
+        dim3 block_conv(16, 16);
+        dim3 grid_conv1((c1_w + block_conv.x - 1) / block_conv.x,
+                        (c1_h + block_conv.y - 1) / block_conv.y,
+                        curN * c1);
+        int  blocks_pool1 = (curN * c1 * p1_h * p1_w + threads - 1) / threads;
+        int  blocks_conv2 = (curN * c2 * c2_h * c2_w + threads - 1) / threads;
+        dim3 grid_conv2((c2_w + block_conv.x - 1) / block_conv.x,
+                        (c2_h + block_conv.y - 1) / block_conv.y,
+                        curN * c2);
+        int  blocks_pool2 = (curN * c2 * p2_h * p2_w + threads - 1) / threads;
+        int  blocks_fc1   = (curN * fc1_out + threads - 1) / threads;
+        int  blocks_fc2   = (curN * fc2_out + threads - 1) / threads;
+        int  blocks_fc3   = (curN * fc3_out + threads - 1) / threads;
 
         // 时间步循环
         for (int t = 0; t < T; ++t) {
             // 1. Conv1层
-            conv2d_kernel_batched<<<blocks_conv1, threads>>>(d_imgs,
-                                                             d_conv1_w,
-                                                             d_conv1_b,
-                                                             d_conv1_out, //输入输出
-                                                             curN,
-                                                             in_c,
-                                                             c1, // N，channels
-                                                             in_h,
-                                                             in_w,
-                                                             k1,
-                                                             1,
-                                                             0,
-                                                             c1_h,
-                                                             c1_w //池化参数
+            conv2d_kernel_batched<<<grid_conv1, block_conv>>>(d_imgs,
+                                                              d_conv1_w,
+                                                              d_conv1_b,
+                                                              d_conv1_out, //输入输出
+                                                              curN,
+                                                              in_c,
+                                                              c1, // N，channels
+                                                              in_h,
+                                                              in_w,
+                                                              k1,
+                                                              1,
+                                                              0,
+                                                              c1_h,
+                                                              c1_w //池化参数
             );
 
             // 2. Conv1后的IF神经元
@@ -381,20 +388,20 @@ std::vector<int> scnn_inference(const std::vector<std::vector<float>>& images,
             );
 
             // 4. Conv2层
-            conv2d_kernel_batched<<<blocks_conv2, threads>>>(d_pool1_out,
-                                                             d_conv2_w,
-                                                             d_conv2_b,
-                                                             d_conv2_out,
-                                                             curN,
-                                                             c1,
-                                                             c2,
-                                                             p1_h,
-                                                             p1_w,
-                                                             k2,
-                                                             1,
-                                                             0,
-                                                             c2_h,
-                                                             c2_w);
+            conv2d_kernel_batched<<<grid_conv2, block_conv>>>(d_pool1_out,
+                                                              d_conv2_w,
+                                                              d_conv2_b,
+                                                              d_conv2_out,
+                                                              curN,
+                                                              c1,
+                                                              c2,
+                                                              p1_h,
+                                                              p1_w,
+                                                              k2,
+                                                              1,
+                                                              0,
+                                                              c2_h,
+                                                              c2_w);
 
             // 5. Conv2后的IF神经元
             ifnode_kernel<<<blocks_conv2, threads>>>(
