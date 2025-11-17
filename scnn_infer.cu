@@ -154,18 +154,16 @@ __global__ void maxpool2d_kernel_batched(const float* input,
                                          int          stride,
                                          int          output_height,
                                          int          output_width) {
-    int out_size = output_height * output_width;
-    int total    = N * channels * out_size;
-    int idx      = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total)
-        return;
+    int ow = blockIdx.x * blockDim.x + threadIdx.x;
+    int oh = blockIdx.y * blockDim.y + threadIdx.y;
 
-    int n   = idx / (channels * out_size);
-    int rem = idx % (channels * out_size);
-    int c   = rem / out_size;
-    int pos = rem % out_size;
-    int oh  = pos / output_width;
-    int ow  = pos % output_width;
+    if (ow >= output_width || oh >= output_height) {
+        return;
+    }
+
+    int nz = blockIdx.z;
+    int n  = nz / channels;
+    int c  = nz % channels;
 
     float max_val = -1e9f;
 
@@ -334,21 +332,30 @@ std::vector<int> scnn_inference(const std::vector<std::vector<float>>& images,
         checkCudaErrors(cudaMemset(d_v4, 0, (size_t)curN * fc2_out * sizeof(float)));
         checkCudaErrors(cudaMemset(d_logits_sum, 0, (size_t)curN * fc3_out * sizeof(float)));
 
+        dim3 block_conv(16, 16);
+
         // 计算每个层的线程块数量
         int  blocks_conv1 = (curN * c1 * c1_h * c1_w + threads - 1) / threads;
-        dim3 block_conv(16, 16);
         dim3 grid_conv1((c1_w + block_conv.x - 1) / block_conv.x,
                         (c1_h + block_conv.y - 1) / block_conv.y,
                         curN * c1);
-        int  blocks_pool1 = (curN * c1 * p1_h * p1_w + threads - 1) / threads;
+        // int  blocks_pool1 = (curN * c1 * p1_h * p1_w + threads - 1) / threads;
+        dim3 grid_pool1((p1_w + block_conv.x - 1) / block_conv.x,
+                        (p1_h + block_conv.y - 1) / block_conv.y,
+                        curN * c1);
+
         int  blocks_conv2 = (curN * c2 * c2_h * c2_w + threads - 1) / threads;
         dim3 grid_conv2((c2_w + block_conv.x - 1) / block_conv.x,
                         (c2_h + block_conv.y - 1) / block_conv.y,
                         curN * c2);
-        int  blocks_pool2 = (curN * c2 * p2_h * p2_w + threads - 1) / threads;
-        int  blocks_fc1   = (curN * fc1_out + threads - 1) / threads;
-        int  blocks_fc2   = (curN * fc2_out + threads - 1) / threads;
-        int  blocks_fc3   = (curN * fc3_out + threads - 1) / threads;
+        // int  blocks_pool2 = (curN * c2 * p2_h * p2_w + threads - 1) / threads;
+        dim3 grid_pool2((p2_w + block_conv.x - 1) / block_conv.x,
+                        (p2_h + block_conv.y - 1) / block_conv.y,
+                        curN * c2);
+
+        int blocks_fc1 = (curN * fc1_out + threads - 1) / threads;
+        int blocks_fc2 = (curN * fc2_out + threads - 1) / threads;
+        int blocks_fc3 = (curN * fc3_out + threads - 1) / threads;
 
         // 时间步循环
         for (int t = 0; t < T; ++t) {
@@ -374,7 +381,7 @@ std::vector<int> scnn_inference(const std::vector<std::vector<float>>& images,
               d_conv1_out, d_v1, d_conv1_spike, curN * c1 * c1_h * c1_w, V_TH, 0.0f);
 
             // 3. Pool1层
-            maxpool2d_kernel_batched<<<blocks_pool1, threads>>>(
+            maxpool2d_kernel_batched<<<grid_pool1, block_conv>>>(
               d_conv1_spike,
               d_pool1_out, // 输入、输出
               curN,
@@ -408,7 +415,7 @@ std::vector<int> scnn_inference(const std::vector<std::vector<float>>& images,
               d_conv2_out, d_v2, d_conv2_spike, curN * c2 * c2_h * c2_w, V_TH, 0.0f);
 
             // 6. Pool2层
-            maxpool2d_kernel_batched<<<blocks_pool2, threads>>>(
+            maxpool2d_kernel_batched<<<grid_pool2, block_conv>>>(
               d_conv2_spike, d_pool2_out, curN, c2, c2_h, c2_w, 2, 2, p2_h, p2_w);
 
             // 7. FC1层 - 直接将池化输出作为扁平化输入
