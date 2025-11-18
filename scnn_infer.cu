@@ -91,20 +91,23 @@ std::vector<float> read_param(const std::string& path) {
 // ===================================================================================
 
 // CUDA Kernel implementations
-__global__ void conv2d_kernel_batched(const float* input,
-                                      const float* weight,
-                                      const float* bias,
-                                      float*       output,
-                                      int          N,
-                                      int          in_channels,
-                                      int          out_channels,
-                                      int          input_height,
-                                      int          input_width,
-                                      int          kernel_size,
-                                      int          stride,
-                                      int          padding,
-                                      int          output_height,
-                                      int          output_width) {
+__global__ void conv2d_IF_kernel_batched(const float* input,
+                                         const float* weight,
+                                         const float* bias,
+                                         // float*       output,
+                                         int    N,
+                                         int    in_channels,
+                                         int    out_channels,
+                                         int    input_height,
+                                         int    input_width,
+                                         int    kernel_size,
+                                         int    stride,
+                                         int    padding,
+                                         int    output_height,
+                                         int    output_width,
+                                         float* membrane,
+                                         float* output,
+                                         float  threshold) {
     int ow = blockIdx.x * blockDim.x + threadIdx.x; // 输出列
     int oh = blockIdx.y * blockDim.y + threadIdx.y; // 输出行
 
@@ -140,8 +143,13 @@ __global__ void conv2d_kernel_batched(const float* input,
         sum += bias[oc];
     }
 
-    int output_idx     = ((n * out_channels + oc) * output_height + oh) * output_width + ow;
-    output[output_idx] = sum;
+    int idx = ((n * out_channels + oc) * output_height + oh) * output_width + ow;
+    // output[output_idx] = sum;
+
+    float v       = membrane[idx] + sum;
+    float spike   = (v >= threshold) ? 1.0f : 0.0f;
+    membrane[idx] = (1.0f - spike) * v;
+    output[idx]   = spike;
 }
 
 __global__ void maxpool2d_kernel_batched(const float* input,
@@ -183,13 +191,15 @@ __global__ void maxpool2d_kernel_batched(const float* input,
     output[output_idx] = max_val;
 }
 
-__global__ void linear_kernel_batched(const float* input,
-                                      const float* weight,
-                                      const float* bias,
-                                      float*       output,
-                                      int          N,
-                                      int          in_features,
-                                      int          out_features) {
+__global__ void linear_IF_kernel_batched(const float* input,
+                                         const float* weight,
+                                         const float* bias,
+                                         int          N,
+                                         int          in_features,
+                                         int          out_features,
+                                         float*       membrane,
+                                         float*       output,
+                                         float        threshold) {
     int idx   = blockIdx.x * blockDim.x + threadIdx.x;
     int total = N * out_features;
     if (idx >= total)
@@ -210,27 +220,40 @@ __global__ void linear_kernel_batched(const float* input,
         sum += bias[o];
     }
 
-    output[idx] = sum;
+    float v       = membrane[idx] + sum;
+    float spike   = (v >= threshold) ? 1.0f : 0.0f;
+    membrane[idx] = (1.0f - spike) * v;
+    output[idx]   = spike;
 }
 
-__global__ void
-ifnode_kernel(float* input, float* membrane, float* output, int size, float threshold, float reset) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size)
-        return;
-
-    float v       = membrane[idx] + input[idx];
-    float s       = (v >= threshold) ? 1.0f : 0.0f;
-    membrane[idx] = (1.0f - s) * v;
-    output[idx]   = s;
-}
-
-__global__ void accumulate_kernel_batched(const float* input, float* accumulator, int N, int size) {
+__global__ void linear_ACC_kernel_batched(const float* input,
+                                          const float* weight,
+                                          const float* bias,
+                                          int          N,
+                                          int          in_features,
+                                          int          out_features,
+                                          float*       accumulator) {
     int idx   = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = N * size;
+    int total = N * out_features;
     if (idx >= total)
         return;
-    accumulator[idx] += input[idx];
+
+    int n = idx / out_features; // 批次索引
+    int o = idx % out_features; // 输出特征索引
+
+    float sum         = 0.0f;
+    int   input_base  = n * in_features;
+    int   weight_base = o * in_features;
+
+    for (int i = 0; i < in_features; ++i) {
+        sum += input[input_base + i] * weight[weight_base + i];
+    }
+
+    if (bias) {
+        sum += bias[o];
+    }
+
+    accumulator[idx] += sum;
 }
 
 std::vector<int> scnn_inference(const std::vector<std::vector<float>>& images,
@@ -267,9 +290,9 @@ std::vector<int> scnn_inference(const std::vector<std::vector<float>>& images,
     const int N = 512;
 
     // 分配设备内存 - 批量版本
-    float *d_imgs, *d_conv1_out, *d_conv1_spike, *d_pool1_out;
-    float *d_conv2_out, *d_conv2_spike, *d_pool2_out;
-    float *d_fc1_out, *d_fc1_spike, *d_fc2_out, *d_fc2_spike, *d_fc3_out;
+    float *d_imgs, *d_conv1_spike, *d_pool1_out;
+    float *d_conv2_spike, *d_pool2_out;
+    float *d_fc1_spike, *d_fc2_spike;
     float* d_logits_sum; // 用于累积FC3输出的缓冲区
 
     // 膜电位
@@ -287,17 +310,12 @@ std::vector<int> scnn_inference(const std::vector<std::vector<float>>& images,
 
     // 分配内存
     checkCudaErrors(cudaMalloc(&d_imgs, imgs_size));
-    checkCudaErrors(cudaMalloc(&d_conv1_out, c1_size));
     checkCudaErrors(cudaMalloc(&d_conv1_spike, c1_size));
     checkCudaErrors(cudaMalloc(&d_pool1_out, p1_size));
-    checkCudaErrors(cudaMalloc(&d_conv2_out, c2_size));
     checkCudaErrors(cudaMalloc(&d_conv2_spike, c2_size));
     checkCudaErrors(cudaMalloc(&d_pool2_out, p2_size));
-    checkCudaErrors(cudaMalloc(&d_fc1_out, fc1_size));
     checkCudaErrors(cudaMalloc(&d_fc1_spike, fc1_size));
-    checkCudaErrors(cudaMalloc(&d_fc2_out, fc2_size));
     checkCudaErrors(cudaMalloc(&d_fc2_spike, fc2_size));
-    checkCudaErrors(cudaMalloc(&d_fc3_out, fc3_size));
     checkCudaErrors(cudaMalloc(&d_logits_sum, fc3_size));
 
     // 分配膜电位
@@ -359,26 +377,24 @@ std::vector<int> scnn_inference(const std::vector<std::vector<float>>& images,
 
         // 时间步循环
         for (int t = 0; t < T; ++t) {
-            // 1. Conv1层
-            conv2d_kernel_batched<<<grid_conv1, block_conv>>>(d_imgs,
-                                                              d_conv1_w,
-                                                              d_conv1_b,
-                                                              d_conv1_out, //输入输出
-                                                              curN,
-                                                              in_c,
-                                                              c1, // N，channels
-                                                              in_h,
-                                                              in_w,
-                                                              k1,
-                                                              1,
-                                                              0,
-                                                              c1_h,
-                                                              c1_w //池化参数
+            // 1. Conv1 + IF层
+            conv2d_IF_kernel_batched<<<grid_conv1, block_conv>>>(d_imgs,
+                                                                 d_conv1_w,
+                                                                 d_conv1_b,
+                                                                 curN,
+                                                                 in_c,
+                                                                 c1, // N，channels
+                                                                 in_h,
+                                                                 in_w,
+                                                                 k1,
+                                                                 1,
+                                                                 0,
+                                                                 c1_h,
+                                                                 c1_w,          //池化参数
+                                                                 d_v1,          //膜电位更新
+                                                                 d_conv1_spike, // IF输出
+                                                                 V_TH           //阈值
             );
-
-            // 2. Conv1后的IF神经元
-            ifnode_kernel<<<blocks_conv1, threads>>>(
-              d_conv1_out, d_v1, d_conv1_spike, curN * c1 * c1_h * c1_w, V_TH, 0.0f);
 
             // 3. Pool1层
             maxpool2d_kernel_batched<<<grid_pool1, block_conv>>>(
@@ -394,53 +410,39 @@ std::vector<int> scnn_inference(const std::vector<std::vector<float>>& images,
               p1_w // 池化参数
             );
 
-            // 4. Conv2层
-            conv2d_kernel_batched<<<grid_conv2, block_conv>>>(d_pool1_out,
-                                                              d_conv2_w,
-                                                              d_conv2_b,
-                                                              d_conv2_out,
-                                                              curN,
-                                                              c1,
-                                                              c2,
-                                                              p1_h,
-                                                              p1_w,
-                                                              k2,
-                                                              1,
-                                                              0,
-                                                              c2_h,
-                                                              c2_w);
-
-            // 5. Conv2后的IF神经元
-            ifnode_kernel<<<blocks_conv2, threads>>>(
-              d_conv2_out, d_v2, d_conv2_spike, curN * c2 * c2_h * c2_w, V_TH, 0.0f);
+            // 4. Conv2 + IF层
+            conv2d_IF_kernel_batched<<<grid_conv2, block_conv>>>(d_pool1_out,
+                                                                 d_conv2_w,
+                                                                 d_conv2_b,
+                                                                 curN,
+                                                                 c1,
+                                                                 c2,
+                                                                 p1_h,
+                                                                 p1_w,
+                                                                 k2,
+                                                                 1,
+                                                                 0,
+                                                                 c2_h,
+                                                                 c2_w,
+                                                                 d_v2,
+                                                                 d_conv2_spike,
+                                                                 V_TH);
 
             // 6. Pool2层
             maxpool2d_kernel_batched<<<grid_pool2, block_conv>>>(
               d_conv2_spike, d_pool2_out, curN, c2, c2_h, c2_w, 2, 2, p2_h, p2_w);
 
-            // 7. FC1层 - 直接将池化输出作为扁平化输入
-            linear_kernel_batched<<<blocks_fc1, threads>>>(
-              d_pool2_out, d_fc1_w, d_fc1_b, d_fc1_out, curN, flat_dim, fc1_out);
+            // 7. FC1+IF层 - 直接将池化输出作为扁平化输入
+            linear_IF_kernel_batched<<<blocks_fc1, threads>>>(
+              d_pool2_out, d_fc1_w, d_fc1_b, curN, flat_dim, fc1_out, d_v3, d_fc1_spike, V_TH);
 
-            // 8. FC1后的IF神经元
-            ifnode_kernel<<<blocks_fc1, threads>>>(
-              d_fc1_out, d_v3, d_fc1_spike, curN * fc1_out, V_TH, 0.0f);
+            // 9. FC2+IF层
+            linear_IF_kernel_batched<<<blocks_fc2, threads>>>(
+              d_fc1_spike, d_fc2_w, d_fc2_b, curN, fc1_out, fc2_out, d_v4, d_fc2_spike, V_TH);
 
-            // 9. FC2层
-            linear_kernel_batched<<<blocks_fc2, threads>>>(
-              d_fc1_spike, d_fc2_w, d_fc2_b, d_fc2_out, curN, fc1_out, fc2_out);
-
-            // 10. FC2后的IF神经元
-            ifnode_kernel<<<blocks_fc2, threads>>>(
-              d_fc2_out, d_v4, d_fc2_spike, curN * fc2_out, V_TH, 0.0f);
-
-            // 11. FC3层（输出层）
-            linear_kernel_batched<<<blocks_fc3, threads>>>(
-              d_fc2_spike, d_fc3_w, d_fc3_b, d_fc3_out, curN, fc2_out, fc3_out);
-
-            // 12. 累积FC3输出到logits_sum
-            accumulate_kernel_batched<<<blocks_fc3, threads>>>(
-              d_fc3_out, d_logits_sum, curN, fc3_out);
+            // 11. FC3+ACC层（输出层）
+            linear_ACC_kernel_batched<<<blocks_fc3, threads>>>(
+              d_fc2_spike, d_fc3_w, d_fc3_b, curN, fc2_out, fc3_out, d_logits_sum);
         }
 
         // 复制累积结果到主机并计算预测
@@ -465,17 +467,12 @@ std::vector<int> scnn_inference(const std::vector<std::vector<float>>& images,
 
     // 释放所有设备内存
     checkCudaErrors(cudaFree(d_imgs));
-    checkCudaErrors(cudaFree(d_conv1_out));
     checkCudaErrors(cudaFree(d_conv1_spike));
     checkCudaErrors(cudaFree(d_pool1_out));
-    checkCudaErrors(cudaFree(d_conv2_out));
     checkCudaErrors(cudaFree(d_conv2_spike));
     checkCudaErrors(cudaFree(d_pool2_out));
-    checkCudaErrors(cudaFree(d_fc1_out));
     checkCudaErrors(cudaFree(d_fc1_spike));
-    checkCudaErrors(cudaFree(d_fc2_out));
     checkCudaErrors(cudaFree(d_fc2_spike));
-    checkCudaErrors(cudaFree(d_fc3_out));
     checkCudaErrors(cudaFree(d_logits_sum));
     checkCudaErrors(cudaFree(d_v1));
     checkCudaErrors(cudaFree(d_v2));
@@ -496,22 +493,29 @@ int main(int argc, char* argv[]) {
     std::string dir = argv[1];
 
     // Load test data
-    auto images = read_mnist_images(dir + "/data/FashionMNIST/raw/t10k-images-idx3-ubyte");
-    auto labels = read_mnist_labels(dir + "/data/FashionMNIST/raw/t10k-labels-idx1-ubyte");
+    auto images =
+      read_mnist_images(dir + "/../../.." + "/data/FashionMNIST/raw/t10k-images-idx3-ubyte");
+    auto labels =
+      read_mnist_labels(dir + "/../../.." + "/data/FashionMNIST/raw/t10k-labels-idx1-ubyte");
     if (images.empty() || labels.empty())
         return 1;
 
+    // auto images = read_mnist_images(dir + "/data/FashionMNIST/raw/t10k-images-idx3-ubyte");
+    // auto labels = read_mnist_labels(dir + "/data/FashionMNIST/raw/t10k-labels-idx1-ubyte");
+    // if (images.empty() || labels.empty())
+    //     return 1;
+
     // Load model parameters to host memory
-    auto conv1_w = read_param(dir + "/weights/conv1.weight.txt");
-    auto conv1_b = read_param(dir + "/weights/conv1.bias.txt");
-    auto conv2_w = read_param(dir + "/weights/conv2.weight.txt");
-    auto conv2_b = read_param(dir + "/weights/conv2.bias.txt");
-    auto fc1_w   = read_param(dir + "/weights/fc1.weight.txt");
-    auto fc1_b   = read_param(dir + "/weights/fc1.bias.txt");
-    auto fc2_w   = read_param(dir + "/weights/fc2.weight.txt");
-    auto fc2_b   = read_param(dir + "/weights/fc2.bias.txt");
-    auto fc3_w   = read_param(dir + "/weights/fc3.weight.txt");
-    auto fc3_b   = read_param(dir + "/weights/fc3.bias.txt");
+    auto conv1_w = read_param(dir + "/conv1.weight.txt");
+    auto conv1_b = read_param(dir + "/conv1.bias.txt");
+    auto conv2_w = read_param(dir + "/conv2.weight.txt");
+    auto conv2_b = read_param(dir + "/conv2.bias.txt");
+    auto fc1_w   = read_param(dir + "/fc1.weight.txt");
+    auto fc1_b   = read_param(dir + "/fc1.bias.txt");
+    auto fc2_w   = read_param(dir + "/fc2.weight.txt");
+    auto fc2_b   = read_param(dir + "/fc2.bias.txt");
+    auto fc3_w   = read_param(dir + "/fc3.weight.txt");
+    auto fc3_b   = read_param(dir + "/fc3.bias.txt");
 
     // --- 1. Allocate all necessary GPU memory ---
     // Device pointers for parameters
